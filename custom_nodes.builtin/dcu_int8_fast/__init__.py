@@ -55,19 +55,31 @@ def _install_vllm_stub() -> None:
 def dcu_int8_linear(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
                     bias: torch.Tensor | None = None, out_dtype: torch.dtype = torch.bfloat16,
                     convrot: bool = False, convrot_groupsize: int = 256,
-                    input_act: str | None = None) -> torch.Tensor:
+                    input_act: str | None = None,
+                    input_act_weight: torch.Tensor | None = None,
+                    input_act_eps: float = 0.0,
+                    residual: torch.Tensor | None = None,
+                    residual_scale: torch.Tensor | None = None,
+                    **kwargs) -> torch.Tensor:
     """gfx936 INT8 linear：lmslim per-token 量化 + hipBLASLt channelwise W8A8 GEMM。
 
     与 eager 版本语义一致：激活动态逐行量化，权重为 per-output-channel scale；
     convrot=True 时先对激活做 Hadamard 旋转。GEMM 使用海光 hipBLASLt INT8 kernel。
+    支持 comfy_kitchen 0.2.41+ 激活融合参数与输出残差累加。
     """
     from lmslim.layers.gemm.int8_utils import per_token_quant_int8
     from lmslim.quantize.quant_ops import hipblaslt_w8a8_channelwise_gemm
-    from comfy_kitchen.backends._activations import apply_input_act
+    try:
+        from comfy_kitchen.backends._activations import apply_input_act, apply_residual
+        x = apply_input_act(x, input_act, input_act_weight, input_act_eps)
+    except (ImportError, TypeError):
+        from comfy_kitchen.backends._activations import apply_input_act
+        apply_residual = None
+        x = apply_input_act(x, input_act)
+
     from comfy_kitchen.backends.eager.quantization import quantize_int8_rowwise
     from comfy_kitchen.tensor.int8_utils import _build_hadamard, _rotate_activation
 
-    x = apply_input_act(x, input_act)
     orig_shape = x.shape
     x2d = x.reshape(-1, x.shape[-1]).contiguous()
     if convrot:
@@ -102,7 +114,11 @@ def dcu_int8_linear(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.T
 
     if bias is not None:
         y = y + bias.to(device=y.device, dtype=y.dtype).reshape(1, -1)
-    return y.reshape(*orig_shape[:-1], n)
+    
+    result = y.reshape(*orig_shape[:-1], n)
+    if residual is not None and apply_residual is not None:
+        result = apply_residual(result, residual, residual_scale)
+    return result
 
 
 def _patch_comfy_kitchen() -> None:
